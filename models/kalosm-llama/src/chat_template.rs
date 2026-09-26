@@ -1,7 +1,14 @@
+//! Rendering of huggingface chat templates.
+//!
+//! The jinja setup here follows hf-chat-template (MIT OR Apache-2.0), which checks its output
+//! against python transformers on real hub templates:
+//! https://github.com/GregoryBolshakov/hf-chat-template
+
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use kalosm_language_model::{ChatMessage, MessageType};
-use minijinja::{context, Environment, ErrorKind, Value};
+use minijinja::{context, Environment, ErrorKind};
 use minijinja_contrib::pycompat;
 
 #[cfg(test)]
@@ -11,6 +18,8 @@ pub(crate) struct HuggingFaceChatTemplate {
     environment: Environment<'static>,
 }
 
+/// The role name a template expects. `MessageType` serializes the system prompt as "developer",
+/// which huggingface templates never match on.
 fn role_name(role: MessageType) -> &'static str {
     match role {
         MessageType::SystemPrompt => "system",
@@ -19,79 +28,75 @@ fn role_name(role: MessageType) -> &'static str {
     }
 }
 
-fn template_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|message| context! { role => role_name(message.role()), content => message.content() })
-        .collect()
-}
-
-fn rewrite_generation_tags(chat_template: &str) -> String {
-    let mut result = String::with_capacity(chat_template.len());
-    let mut rest = chat_template;
-
-    while let Some(start) = rest.find("{%") {
-        let (prefix, after_prefix) = rest.split_at(start);
-        result.push_str(prefix);
-        let Some(end) = after_prefix.find("%}") else {
-            result.push_str(after_prefix);
-            return result;
+/// Replace the `{% generation %}` block with an always true `{% if %}` block.
+///
+/// Transformers adds the tag to mark which bytes the assistant generated. It does not change the
+/// output, but minijinja has no way to add a custom statement and fails to compile the template.
+fn neutralize_generation_tags(source: &str) -> Cow<'_, str> {
+    let mut out: Option<String> = None;
+    let mut flushed = 0; // bytes of source already copied
+    let mut cursor = 0;
+    while let Some(found) = source[cursor..].find("{%") {
+        let open = cursor + found;
+        let Some(found_end) = source[open + 2..].find("%}") else {
+            break; // let minijinja report the syntax error
         };
-        let tag = &after_prefix[2..end];
-        let trimmed = tag.trim();
-        let (start_trim, body) = if let Some(first) = trimmed.chars().next() {
-            if first == '-' || first == '+' {
-                (Some(first), trimmed[1..].trim_start())
-            } else {
-                (None, trimmed)
+        let close = open + 2 + found_end + 2;
+        let inner = &source[open + 2..close - 2];
+        // keep any whitespace control marker the tag was written with
+        let lead = inner.starts_with(['-', '+']);
+        let trail = inner.ends_with(['-', '+']);
+        let keyword = inner
+            .trim_start_matches(['-', '+'])
+            .trim_end_matches(['-', '+'])
+            .trim();
+        let replacement = match keyword {
+            "generation" => "if true",
+            "endgeneration" => "endif",
+            _ => {
+                cursor = close;
+                continue;
             }
-        } else {
-            (None, trimmed)
         };
-        let (body, end_trim) = if let Some(last) = body.chars().last() {
-            if last == '-' || last == '+' {
-                (body[..body.len() - last.len_utf8()].trim_end(), Some(last))
-            } else {
-                (body, None)
-            }
-        } else {
-            (body, None)
-        };
-        if body == "generation" || body == "endgeneration" {
-            result.push_str("{% ");
-            if let Some(start_trim) = start_trim {
-                result.push(start_trim);
-                result.push(' ');
-            }
-            result.push_str(if body == "generation" {
-                "if true"
-            } else {
-                "endif"
-            });
-            if let Some(end_trim) = end_trim {
-                result.push(' ');
-                result.push(end_trim);
-            }
-            result.push_str(" %}");
-        } else {
-            result.push_str(&after_prefix[..end + 2]);
+        let out = out.get_or_insert_with(String::new);
+        out.push_str(&source[flushed..open]);
+        out.push_str("{%");
+        if lead {
+            out.push_str(&inner[..1]);
         }
-        rest = &after_prefix[end + 2..];
+        out.push(' ');
+        out.push_str(replacement);
+        out.push(' ');
+        if trail {
+            out.push_str(&inner[inner.len() - 1..]);
+        }
+        out.push_str("%}");
+        flushed = close;
+        cursor = close;
     }
-
-    result.push_str(rest);
-    result
+    match out {
+        Some(mut out) => {
+            out.push_str(&source[flushed..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(source),
+    }
 }
 
 impl HuggingFaceChatTemplate {
     pub(crate) fn create(chat_template: impl Display) -> Result<Self, minijinja::Error> {
-        let chat_template = rewrite_generation_tags(&chat_template.to_string());
+        let chat_template = neutralize_generation_tags(&chat_template.to_string()).into_owned();
         let mut environment = Environment::new();
+
+        // enable python compatibility methods because most models are tested with python
+        environment.set_unknown_method_callback(pycompat::unknown_method_callback);
+
+        // transformers compiles templates with both flags on, so the whitespace around block
+        // tags has to be trimmed the same way here
         environment.set_trim_blocks(true);
         environment.set_lstrip_blocks(true);
 
-        environment.set_unknown_method_callback(pycompat::unknown_method_callback);
-
+        // add the raise_exception function from huggingface templates to the environment
         let raise_exception = |err_text: String| -> Result<String, minijinja::Error> {
             Err(minijinja::Error::new(
                 ErrorKind::InvalidOperation,
@@ -99,6 +104,8 @@ impl HuggingFaceChatTemplate {
             ))
         };
         environment.add_function("raise_exception", raise_exception);
+
+        // compile the template expression in the environment
         environment.add_template_owned("main", chat_template)?;
 
         Ok(Self { environment })
@@ -112,49 +119,15 @@ impl HuggingFaceChatTemplate {
         add_generation_prompt: bool,
     ) -> Result<String, minijinja::Error> {
         let tools: Option<()> = None;
-        let messages = template_messages(messages);
+        let messages = messages
+            .iter()
+            .map(|message| context! { role => role_name(message.role()), content => message.content() })
+            .collect::<Vec<_>>();
         let ctx = context! { bos_token, eos_token, messages, add_generation_prompt, tools };
         let template = self.environment.get_template("main")?;
         let result = template.render(&ctx)?;
         Ok(result)
     }
-}
-
-#[test]
-fn test_generation_tag_is_ignored() {
-    let template = "{% for message in messages %}<|{{ message['role'] }}|>{% if message['role'] == 'assistant' %}{% generation %}{{ message['content'] }}{% endgeneration %}{% else %}{{ message['content'] }}{% endif %}{% endfor %}";
-    let template = HuggingFaceChatTemplate::create(template).unwrap();
-    let inputs = [
-        ChatMessage::new(MessageType::UserMessage, "Hello!".to_string()),
-        ChatMessage::new(MessageType::ModelAnswer, "Hi.".to_string()),
-    ];
-    let result = template.format("<s>", "</s>", &inputs, false).unwrap();
-    assert_eq!(result, "<|user|>Hello!<|assistant|>Hi.");
-}
-
-#[test]
-fn test_whitespace_control_matches_transformers() {
-    let template = "{% for message in messages %}\n{{ message['role'] }}\n{% endfor %}";
-    let template = HuggingFaceChatTemplate::create(template).unwrap();
-    let inputs = [
-        ChatMessage::new(MessageType::UserMessage, "Hello".to_string()),
-        ChatMessage::new(MessageType::ModelAnswer, "Hi".to_string()),
-    ];
-    let result = template.format("<s>", "</s>", &inputs, false).unwrap();
-    assert_eq!(result, "user\nassistant\n");
-}
-
-#[test]
-fn test_system_role_is_serialized_as_system() {
-    let template =
-        "{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] }}{% endif %}";
-    let template = HuggingFaceChatTemplate::create(template).unwrap();
-    let inputs = [ChatMessage::new(
-        MessageType::SystemPrompt,
-        "You are Qwen".to_string(),
-    )];
-    let result = template.format("<s>", "</s>", &inputs, false).unwrap();
-    assert_eq!(result, "You are Qwen");
 }
 
 #[test]
@@ -302,4 +275,113 @@ fn test_mistral_chat_template() {
         result,
         r#"<s> [INST] Hello, how are you? [/INST] I'm doing great. How can I help you today?</s> [INST] I'd like to show off how chat templating works! [/INST]"#
     )
+}
+
+#[test]
+fn test_zephyr_chat_template() {
+    // HuggingFaceH4/zephyr-7b-beta template, output checked against python transformers
+    let template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}";
+
+    let template = HuggingFaceChatTemplate::create(template).unwrap();
+
+    let inputs = [
+        ChatMessage::new(MessageType::SystemPrompt, "You are terse.".to_string()),
+        ChatMessage::new(MessageType::UserMessage, "Hello!".to_string()),
+        ChatMessage::new(MessageType::ModelAnswer, "Hi.".to_string()),
+        ChatMessage::new(MessageType::UserMessage, "What is 2+2?".to_string()),
+    ];
+
+    let result = template.format("<s>", "</s>", &inputs, true).unwrap();
+    assert_eq!(
+        result,
+        r#"<|system|>
+You are terse.</s>
+<|user|>
+Hello!</s>
+<|assistant|>
+Hi.</s>
+<|user|>
+What is 2+2?</s>
+<|assistant|>
+"#
+    );
+}
+
+#[test]
+fn test_phi_3_chat_template() {
+    // microsoft/Phi-3-mini-4k-instruct template, output checked against python transformers
+    let template = "{% for message in messages %}{% if message['role'] == 'system' %}{{'<|system|>\n' + message['content'] + '<|end|>\n'}}{% elif message['role'] == 'user' %}{{'<|user|>\n' + message['content'] + '<|end|>\n'}}{% elif message['role'] == 'assistant' %}{{'<|assistant|>\n' + message['content'] + '<|end|>\n'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\n' }}{% else %}{{ eos_token }}{% endif %}";
+
+    let template = HuggingFaceChatTemplate::create(template).unwrap();
+
+    let inputs = [
+        ChatMessage::new(MessageType::SystemPrompt, "You are terse.".to_string()),
+        ChatMessage::new(MessageType::UserMessage, "Hello!".to_string()),
+        ChatMessage::new(MessageType::ModelAnswer, "Hi.".to_string()),
+        ChatMessage::new(MessageType::UserMessage, "What is 2+2?".to_string()),
+    ];
+
+    let result = template
+        .format("<s>", "<|endoftext|>", &inputs, true)
+        .unwrap();
+    assert_eq!(
+        result,
+        r#"<|system|>
+You are terse.<|end|>
+<|user|>
+Hello!<|end|>
+<|assistant|>
+Hi.<|end|>
+<|user|>
+What is 2+2?<|end|>
+<|assistant|>
+"#
+    );
+}
+
+#[test]
+fn test_gemma_3_chat_template() {
+    // google/gemma-3-4b-it template, output checked against python transformers
+    let template = "{{ bos_token }}\n{%- if messages[0]['role'] == 'system' -%}\n    {%- if messages[0]['content'] is string -%}\n        {%- set first_user_prefix = messages[0]['content'] + '\n\n' -%}\n    {%- else -%}\n        {%- set first_user_prefix = messages[0]['content'][0]['text'] + '\n\n' -%}\n    {%- endif -%}\n    {%- set loop_messages = messages[1:] -%}\n{%- else -%}\n    {%- set first_user_prefix = \"\" -%}\n    {%- set loop_messages = messages -%}\n{%- endif -%}\n{%- for message in loop_messages -%}\n    {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}\n        {{ raise_exception(\"Conversation roles must alternate user/assistant/user/assistant/...\") }}\n    {%- endif -%}\n    {%- if (message['role'] == 'assistant') -%}\n        {%- set role = \"model\" -%}\n    {%- else -%}\n        {%- set role = message['role'] -%}\n    {%- endif -%}\n    {{ '<start_of_turn>' + role + '\n' + (first_user_prefix if loop.first else \"\") }}\n    {%- if message['content'] is string -%}\n        {{ message['content'] | trim }}\n    {%- elif message['content'] is iterable -%}\n        {%- for item in message['content'] -%}\n            {%- if item['type'] == 'image' -%}\n                {{ '<start_of_image>' }}\n            {%- elif item['type'] == 'text' -%}\n                {{ item['text'] | trim }}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- else -%}\n        {{ raise_exception(\"Invalid content type\") }}\n    {%- endif -%}\n    {{ '<end_of_turn>\n' }}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{'<start_of_turn>model\n'}}\n{%- endif -%}\n";
+
+    let template = HuggingFaceChatTemplate::create(template).unwrap();
+
+    let inputs = [
+        ChatMessage::new(MessageType::SystemPrompt, "You are terse.".to_string()),
+        ChatMessage::new(MessageType::UserMessage, "Hello!".to_string()),
+        ChatMessage::new(MessageType::ModelAnswer, "Hi.".to_string()),
+        ChatMessage::new(MessageType::UserMessage, "What is 2+2?".to_string()),
+    ];
+
+    let result = template.format("<bos>", "<eos>", &inputs, true).unwrap();
+    assert_eq!(
+        result,
+        r#"<bos><start_of_turn>user
+You are terse.
+
+Hello!<end_of_turn>
+<start_of_turn>model
+Hi.<end_of_turn>
+<start_of_turn>user
+What is 2+2?<end_of_turn>
+<start_of_turn>model
+"#
+    );
+}
+
+#[test]
+fn test_generation_tag_is_ignored() {
+    // some hub templates (SmolLM3) wrap the answer in a `generation` block to mark which bytes
+    // the model generated. It does not change the rendered text.
+    let template = "{% for message in messages %}<|{{ message['role'] }}|>{% if message['role'] == 'assistant' %}{% generation %}{{ message['content'] }}{% endgeneration %}{% else %}{{ message['content'] }}{% endif %}{% endfor %}";
+
+    let template = HuggingFaceChatTemplate::create(template).unwrap();
+
+    let inputs = [
+        ChatMessage::new(MessageType::UserMessage, "Hello!".to_string()),
+        ChatMessage::new(MessageType::ModelAnswer, "Hi.".to_string()),
+    ];
+
+    let result = template.format("<s>", "</s>", &inputs, false).unwrap();
+    assert_eq!(result, "<|user|>Hello!<|assistant|>Hi.");
 }
